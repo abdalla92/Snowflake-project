@@ -1,0 +1,371 @@
+
+/*
+    Overview
+    This is Snowflake end-to-end data pipeline project that ingests JSON log files from S3, parses them into a raw table,
+    enriches them with geolocation and time-of-day metadata, and incrementally merges new records into an enhanced table
+    using Snowpipe + Streams + Tasks. It describes purpose, inputs, outputs, dependencies, and operational notes.
+*/
+
+--1) ROLE / DATABASE / SCHEMA SETUP
+-- Purpose: Ensure execution context exists with appropriate privileges and separate raw & enhanced data.
+-- Key actions: set role to SYSADMIN (or equivalent), create database AGS_GAME_AUDIENCE, create schemas RAW and ENHANCED.
+-- Notes: Creating schemas selectively avoids altering the PUBLIC schema and helps separation of concerns (raw vs enriched).
+-- Security: Use least-privilege roles in production and ensure the role used can create objects and manage pipes/tasks.
+USE ROLE SYSADMIN;
+CREATE DATABASE AGS_GAME_AUDIENCE;
+USE AGS_GAME_AUDIENCE;
+DROP SCHEMA PUBLIC; -- Removed to avoid potential issues with default schema dependencies
+CREATE SCHEMA RAW;
+
+
+--2) EXTERNAL STAGE CREATION
+-- Purpose: Create an external stage pointing to an S3 bucket (s3://uni-kishore-pipeline) used as the ingestion source.
+-- Inputs: S3 bucket URL and credentials (external stage must be configured with an integration or credentials).
+-- Outputs: Stage object RAW.UNI_KISHORE_PIPELINE that Snowpipe and COPY commands reference.
+-- Notes: DIRECTORY = (ENABLE = true) treats the stage as a named directory for listing. Confirm correct integration and IAM policy.
+create stage RAW.UNI_KISHORE_PIPELINE
+url='s3://uni-kishore-pipeline'
+DIRECTORY = ( ENABLE = true );
+
+--3) STAGE CONTENT VALIDATION (LIST)
+/*  Verifying files present on the stage and that Snowflake can access the S3 bucket.
+    Useful for troubleshooting permission issues before trying to load data.
+*/
+list @AGS_GAME_AUDIENCE.RAW.UNI_KISHORE_PIPELINE;
+
+--4) FILE FORMAT DEFINITION (JSON)
+/*
+    Defined JSON file parsing rules (type = json, strip_outer_array = true).
+    JSON files may be newline-delimited or an array wrapper; strip_outer_array helps when files contain a top-level array.
+    Named file format RAW.FF_JSON_LOGS used by COPY/SELECT from stage.
+    Tweak json parsing options if source changes (e.g., multiline, encoding).Create file format AGS_GAME_AUDIENCE.RAW.FF_JSON_LOGS
+*/
+Create file format AGS_GAME_AUDIENCE.RAW.FF_JSON_LOGS
+type = json
+strip_outer_array = true;
+
+--5) SAMPLE SELECT FROM STAGE (PARSE JSON)
+/*  
+    Previewing and validating JSON parsing by selecting $1 from staged files using the file format.
+    Raw JSON objects parsed into VARIANT when selecting $1.
+*/
+select $1 from @AGS_GAME_AUDIENCE.RAW.UNI_KISHORE_PIPELINE
+(file_format => 'AGS_GAME_AUDIENCE.RAW.FF_JSON_LOGS');
+
+
+--6) RAW TABLE CREATION (ED_PIPELINE_LOGS)
+/*
+    Persist parsed JSON logs into a structured raw table with metadata and selected parsed fields for faster downstream processing.
+        - Columns added:
+        - METADATA$FILENAME and METADATA$FILE_ROW_NUMBER: provenance for each row.
+        - current_timestamp(0) as load_ltz: capture load time (useful for auditing).
+        - Parsed JSON fields: datetime_iso8601 -> timestamp_ntz; user_event, user_login, ip_address -> text.
+    Storing both parsed fields and metadata supports traceability, debugging and idempotent processing.
+*/
+CREATE TABLE RAW.ED_PIPELINE_LOGS AS
+ SELECT 
+    METADATA$FILENAME as log_file_name --new metadata column
+  , METADATA$FILE_ROW_NUMBER as log_file_row_id --new metadata column
+  , current_timestamp(0) as load_ltz --new local time of load
+  , get($1,'datetime_iso8601')::timestamp_ntz as DATETIME_ISO8601
+  , get($1,'user_event')::text as USER_EVENT
+  , get($1,'user_login')::text as USER_LOGIN
+  , get($1,'ip_address')::text as IP_ADDRESS    
+  FROM @AGS_GAME_AUDIENCE.RAW.UNI_KISHORE_PIPELINE
+  (file_format => 'FF_JSON_LOGS');
+
+
+--7) SNOWPIPE / PIPE AUTO-INGEST CONFIGURATION
+/*
+    Creating a pipe AGS_GAME_AUDIENCE.RAW.PIPE_GET_NEW_FILES to automatically COPY new files from the stage into the raw table.
+    - Key options:
+        - auto_ingest=true: integrates with cloud notifications (SNS) for near-real-time ingestion.
+        - aws_sns_topic: ARN used to receive event notifications for new S3 objects.
+        - COPY statement references the named file format.
+    - Operational notes:
+        - Ensure SNS topic is correctly configured to forward notifications to Snowflake (via the storage integration).
+        - Monitor pipe execution history and error queues.
+        - Consider COPY options for error handling (e.g., ON_ERROR, FILES) based on tolerance for bad rows.
+*/
+create or replace pipe AGS_GAME_AUDIENCE.RAW.PIPE_GET_NEW_FILES 
+    auto_ingest=true 
+    aws_sns_topic='arn:aws:sns:us-west-2:321463406630:dngw_topic' 
+as 
+COPY INTO ED_PIPELINE_LOGS
+FROM (
+    SELECT 
+    METADATA$FILENAME as log_file_name 
+  , METADATA$FILE_ROW_NUMBER as log_file_row_id 
+  , current_timestamp(0) as load_ltz 
+  , get($1,'datetime_iso8601')::timestamp_ntz as DATETIME_ISO8601
+  , get($1,'user_event')::text as USER_EVENT
+  , get($1,'user_login')::text as USER_LOGIN
+  , get($1,'ip_address')::text as IP_ADDRESS    
+  FROM @AGS_GAME_AUDIENCE.RAW.UNI_KISHORE_PIPELINE
+)
+file_format = (format_name = 'FF_JSON_LOGS');
+
+-- Activate the pipe to start ingestion
+alter pipe AGS_GAME_AUDIENCE.RAW.PIPE_GET_NEW_FILES resume;
+
+--8) TIME-OF-DAY LOOKUP TABLE (time_of_day_lu)
+/*
+    Mapping hour_of_day (0-23) to human-readable time-of-day labels (e.g., Early morning, Mid-afternoon).
+    Inserted statically once; keep idempotent by using create table if not exists or use merge for updates.
+*/
+create table ags_game_audience.raw.time_of_day_lu
+(  hour_of_day number
+   ,tod_name varchar(25)
+);
+insert into time_of_day_lu
+values
+(6,'Early morning'),
+(7,'Early morning'),
+(8,'Early morning'),
+(9,'Mid-morning'),
+(10,'Mid-morning'),
+(11,'Late morning'),
+(12,'Late morning'),
+(13,'Early afternoon'),
+(14,'Early afternoon'),
+(15,'Mid-afternoon'),
+(16,'Mid-afternoon'),
+(17,'Late afternoon'),
+(18,'Late afternoon'),
+(19,'Early evening'),
+(20,'Early evening'),
+(21,'Late evening'),
+(22,'Late evening'),
+(23,'Late evening'),
+(0,'Late at night'),
+(1,'Late at night'),
+(2,'Late at night'),
+(3,'Toward morning'),
+(4,'Toward morning'),
+(5,'Toward morning');
+
+--9) DATA VERIFICATION / AGGREGATION CHECK
+/*
+    Validating the lookup table was populated correctly via basic grouping and aggregation (e.g., listagg).
+    Useful sanity check after inserts.
+    */
+select tod_name, listagg(hour,',') as hours
+from time_of_day_lu
+group by tod_name;
+
+--10) CHANGE DATA CAPTURE STREAM (ed_cdc_stream)
+/*
+    Creating a stream on the raw table to capture inserts/updates/deletes for incremental processing.
+    A change stream object that contains only the delta since last consumed offset.
+    Operational notes:
+    - Streams require regular consumption (via tasks or manual queries) to advance offsets; otherwise retention may be impacted.
+    - Confirm stream has appropriate retention and the downstream consumer handles duplicates and idempotency.
+*/
+create or replace stream ags_game_audience.raw.ed_cdc_stream 
+on table AGS_GAME_AUDIENCE.RAW.ED_PIPELINE_LOGS;
+
+--11) STREAM MONITORING (show streams, system$stream_has_data)
+/*
+    Inspecting streams and programmatically check whether there is pending data to process.
+    system$stream_has_data('ed_cdc_stream') returns boolean-like JSON to be used in task WHEN clauses.
+*/
+show streams;
+select parse_json(system$stream_has_data('ed_cdc_stream'));
+
+
+--12) RAW VIEW CREATION (RAW.LOGS)
+/*
+    Providing a convenient view that exposes parsed JSON fields (ip_address, user_event, user_login, datetime_iso8601)
+    while also exposing raw/metadata columns (log_file_name, log_file_row_id, load_ltz).
+    - Views enable consistent parsing logic across downstream consumers and decouple raw VARIANT structure from enriched tables.
+*/
+CREATE or replace VIEW RAW.LOGS as 
+select
+    RAW_LOG:ip_address::text as ip_address,
+    --RAW_LOG:agent::text as agent,
+    RAW_LOG:user_event::text as user_event,
+    RAW_LOG:user_login::text as user_login,
+    RAW_LOG:datetime_iso8601::timestamp_ntz as datetime_iso8601,
+    log_file_name,
+    log_file_row_id,
+    load_ltz,
+    DATETIME_ISO8601,
+    USER_EVENT,
+    USER_LOGIN,
+from ED_PIPELINE_LOGS  RAW_LOG
+where RAW_LOG:ip_address::text is not null;
+
+--13) ENHANCED SCHEMA & ENRICHED TABLE CREATION (ENHANCED.LOGS_ENHANCED)
+/*
+    Creating an enriched table that combines parsed log fields with external geolocation and time-of-day enrichment.
+    - Enrichments:
+        - Geolocation: join to an IP geolocation dataset (IPINFO_GEOLOC.demo.location) using IP address transformed to an integer join key.
+        - Time conversion: convert UTC event timestamps to local timezone returned by the geolocation table using CONVERT_TIMEZONE.
+        - Day name and TOD: compute DOW_NAME (DAYNAME) and join to time_of_day_lu for TOD_NAME.
+    - Notes:
+        - Conversions consider timezone strings from geolocation; ensure values are valid timezones for CONVERT_TIMEZONE.
+        - When joining by IP range (start_ip_int/end_ip_int), be mindful of indexing and performance—IP geolocation tables can be large.
+*/
+create or replace schema ags_game_audience.enhanced;
+create table ags_game_audience.enhanced.logs_enhanced as
+SELECT logs.ip_address
+, logs.user_login as GAMER_NAME
+, logs.user_event as GAME_EVENT_NAME
+, logs.datetime_iso8601 as GAME_EVENT_UTC
+, city
+, region
+, country
+, timezone as GAMER_LTZ_NAME
+, convert_timezone('UTC',timezone ,logs.datetime_iso8601) as game_event_ltz
+, DAYNAME(game_event_ltz) as DOW_NAME
+, tod.tod_name as TOD_NAME
+from AGS_GAME_AUDIENCE.RAW.LOGS logs
+JOIN IPINFO_GEOLOC.demo.location loc 
+ON IPINFO_GEOLOC.public.TO_JOIN_KEY(logs.ip_address) = loc.join_key
+AND IPINFO_GEOLOC.public.TO_INT(logs.ip_address)  
+BETWEEN start_ip_int AND end_ip_int
+JOIN AGS_GAME_AUDIENCE.RAW.TIME_OF_DAY_LU tod
+ON tod.HOUR_OF_DAY = hour(game_event_ltz);
+
+--14) MERGE TASK (CDC_LOAD_LOGS_ENHANCED)
+/*
+    Create a scheduled task that consumes the ed_cdc_stream and MERGEs new records into the enriched table.
+    Key behavior:
+    - Task runs every 5 minutes (SCHEDULE = '5 minutes') and is gated by WHEN system$stream_has_data('ed_cdc_stream') to avoid unnecessary runs.
+    - MERGE ON match keys: GAMER_NAME, GAME_EVENT_UTC, GAME_EVENT_NAME to avoid duplicate inserts of the same event.
+    - WHEN NOT MATCHED: insert new enriched rows with geolocation and time-of-day fields.
+        Operational points:
+        - TASK uses USER_TASK_MANAGED_INITIAL_WAREHOUSE_SIZE to size compute; tune for workload.
+        - Ensureing task role has privileges on all referenced objects (stream, geolocation schema, raw.lookup tables).
+*/
+create or replace task AGS_GAME_AUDIENCE.RAW.CDC_LOAD_LOGS_ENHANCED
+	USER_TASK_MANAGED_INITIAL_WAREHOUSE_SIZE='XSMALL'
+	SCHEDULE = '5 minutes'
+    when
+        system$stream_has_data('ed_cdc_stream')
+	as 
+MERGE INTO AGS_GAME_AUDIENCE.ENHANCED.LOGS_ENHANCED e
+USING (
+        SELECT cdc.ip_address 
+        , cdc.user_login as GAMER_NAME
+        , cdc.user_event as GAME_EVENT_NAME
+        , cdc.datetime_iso8601 as GAME_EVENT_UTC
+        , city
+        , region
+        , country
+        , timezone as GAMER_LTZ_NAME
+        , CONVERT_TIMEZONE( 'UTC',timezone,cdc.datetime_iso8601) as game_event_ltz
+        , DAYNAME(game_event_ltz) as DOW_NAME
+        , TOD_NAME
+        from ags_game_audience.raw.ed_cdc_stream cdc
+        JOIN ipinfo_geoloc.demo.location loc 
+        ON ipinfo_geoloc.public.TO_JOIN_KEY(cdc.ip_address) = loc.join_key
+        AND ipinfo_geoloc.public.TO_INT(cdc.ip_address) 
+        BETWEEN start_ip_int AND end_ip_int
+        JOIN AGS_GAME_AUDIENCE.RAW.TIME_OF_DAY_LU tod
+        ON HOUR(game_event_ltz) = tod.hour_of_day
+      ) r
+ON r.GAMER_NAME = e.GAMER_NAME
+AND r.GAME_EVENT_UTC = e.GAME_EVENT_UTC
+AND r.GAME_EVENT_NAME = e.GAME_EVENT_NAME 
+WHEN NOT MATCHED THEN 
+INSERT (IP_ADDRESS, GAMER_NAME, GAME_EVENT_NAME
+        , GAME_EVENT_UTC, CITY, REGION
+        , COUNTRY, GAMER_LTZ_NAME, GAME_EVENT_LTZ
+        , DOW_NAME, TOD_NAME)
+        VALUES
+        (r.IP_ADDRESS, r.GAMER_NAME, r.GAME_EVENT_NAME
+        , r.GAME_EVENT_UTC, r.CITY, r.REGION
+        , r.COUNTRY, r.GAMER_LTZ_NAME, r.GAME_EVENT_LTZ
+        , r.DOW_NAME, r.TOD_NAME);
+        
+--15) TASK & PIPE LIFECYCLE MANAGEMENT (RESUME / SUSPEND / PAUSE PIPE)
+/*
+    Demonstrating how to resume/suspend the task and pause the pipe for maintenance or troubleshooting.
+    - Guidance:
+        - Pause pipe to stop ingestion to raw table while troubleshooting downstream tasks.
+        - Suspend task when preventing MERGE operations temporarily; resume once issues resolved.
+        - After resuming, verify system$stream_has_data and pipeline behavior (i.e., no data loss).
+*/
+alter task AGS_GAME_AUDIENCE.RAW.CDC_LOAD_LOGS_ENHANCED resume;
+alter task AGS_GAME_AUDIENCE.RAW.CDC_LOAD_LOGS_ENHANCED suspend;
+alter pipe AGS_GAME_AUDIENCE.RAW.PIPE_GET_NEW_FILES set pipe_execution_paused = true;
+
+
+
+--16) EXAMPLE ANALYTICAL QUERIES (listagg and sessionization)
+/*  
+    Providing sample queries over the enriched data to:
+        - Aggregate timestamps per gamer (listagg) to show login/logout pairs.
+        - Compute session lengths by pairing successive events per gamer using LEAD() and DATEDIFF in minutes.
+    - Notes:
+        - LEAD-based sessionization assumes ordered events by GAME_EVENT_LTZ; validate event semantics (login vs logout event types) for accurate session definition.
+        - Use COALESCE to handle open sessions (no subsequent logout).
+        - For production analytics, consider more robust sessionization logic that filters on event types (e.g., explicit login/logout) and accounts for inactivity timeouts.
+*/
+-- This query aggregates all game event timestamps (login/logout) per gamer into a single row using
+select GAMER_NAME
+      , listagg(GAME_EVENT_LTZ,' / ') as login_and_logout
+from AGS_GAME_AUDIENCE.ENHANCED.LOGS_ENHANCED 
+group by gamer_name;
+
+--the ListAgg function can put both login and logout into a single column in a single row
+-- if we don't have a logout, just one timestamp will appear
+-- Example output:
+-- | GAMER_NAME | login_and_logout                                 |
+-- |------------|--------------------------------------------------|
+-- | alice      | 2024-06-01 10:00:00 / 2024-06-01 12:00:00        |
+-- | bob        | 2024-06-01 09:30:00                              |
+--You can run this code in a WORKSHEET
+
+
+-- This query calculates each game session's length by pairing each login with the next event (logout) for the same gamer using LEAD(),
+-- and uses COALESCE() to handle cases where there is no subsequent logout event (returns 0 in such cases).
+select GAMER_NAME
+       ,game_event_ltz as login 
+       ,lead(game_event_ltz) 
+                OVER (
+                    partition by GAMER_NAME 
+                    order by GAME_EVENT_LTZ
+                ) as logout
+       ,coalesce(datediff('mi', login, logout),0) as game_session_length
+from AGS_GAME_AUDIENCE.ENHANCED.LOGS_ENHANCED
+order by game_session_length desc;
+
+-- Considerations and best practices:
+/*
+1) ERROR HANDLING, DATA QUALITY, AND OBSERVABILITY
+- Validation & Reconciliation:
+    - Compare METADATA$FILENAME/METADATA$FILE_ROW_NUMBER to raw stage files for traceability.
+    - Implement checks for malformed JSON, missing mandatory fields (ip_address, datetime_iso8601), and timezone parsing failures.
+- Error Handling:
+    - Set COPY options (ON_ERROR) to redirect bad files/rows to error tables or stage a separate error queue.
+    - Build alerts for repeated failures in pipe or task executions.
+- Observability:
+    - Monitor PIPE_STATUS, TASK_HISTORY, and QUERY_HISTORY for failures and latency.
+    - Capture metrics: files processed per minute, avg rows per file, task runtimes, and stream backlog.
+- Idempotency and Duplicates:
+    - Use MERGE match keys carefully to avoid duplicate enriched rows; consider additional dedupe keys (file name + row id) if needed.
+
+2) PERFORMANCE & COST CONSIDERATIONS
+- MINIMIZE DATA TRANSFER: Push parsing and simple enrichment into Snowflake via COPY and MERGE to use Snowflake compute efficiently.
+- COMPUTE SIZING: Tune task warehouse size to balance concurrency and cost.
+- PARTITIONING / CLUSTERING: For very large enriched tables, consider clustering keys (e.g., gamer_name, game_event_utc) to improve query performance.
+- INDEX-FRIENDLY JOINS: IP geolocation joins by integer ranges can be expensive; if high throughput is expected, consider precomputing hash ranges, using search optimization service, or using a denormalized lookup.
+
+3) SECURITY & DATA PRIVACY
+- Protect sensitive PII (user_login, ip_address) according to policy: mask, anonymize, or restrict access as appropriate.
+- Ensure proper network and IAM controls on the S3 bucket and Snowflake storage integration and minimal privileges for SNS topics.
+- Consider row access policies and masking policies where necessary.
+
+4) TESTING AND DEPLOYMENT
+- Test workflow end-to-end in a dev environment with representative sample files.
+- Validate timezone conversions with known test IPs/timezones.
+- Dry-run MERGE using SELECTs from the stream to ensure expected result set before enabling task.
+- Add automated tests and regression checks to protect against schema changes in source JSON.
+
+5) MAINTENANCE & OPERATIONS
+- Housekeeping: Periodically vacuum/rotate archived raw data if retention required or move older raw files to cheaper storage.
+- Stream retention: ensure streams are consumed often enough to avoid retention lapse.
+- Updates to enrichments: When IP geolocation data or TOD mapping needs updates, plan for incremental refresh and backfills.
+*/
